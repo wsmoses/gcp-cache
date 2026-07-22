@@ -1,8 +1,18 @@
 import * as core from "@actions/core";
-import * as exec from "@actions/exec";
+import * as io from "@actions/io";
 import { Storage as GoogleCloudStorage } from "@google-cloud/storage";
-import * as fs from "fs";
+import * as child_process from "child_process";
 import * as path from "path";
+import { pipeline } from "stream/promises";
+
+async function isZstdAvailable(): Promise<boolean> {
+    try {
+        const zstdPath = await io.which("zstd", false);
+        return !!zstdPath;
+    } catch {
+        return false;
+    }
+}
 
 export async function restoreGcsCache(
     gcpBucket: string,
@@ -13,14 +23,6 @@ export async function restoreGcsCache(
     options?: { lookupOnly?: boolean }
 ): Promise<string | undefined> {
     try {
-        const tempDir =
-            process.env["RUNNER_TEMP"] ||
-            (process.platform === "win32" ? "C:\\Windows\\Temp" : "/tmp");
-        const tarPath = path.join(
-            tempDir,
-            `cache_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.tar.gz`
-        );
-
         const storage = new GoogleCloudStorage();
         const bucket = storage.bucket(gcpBucket);
 
@@ -28,50 +30,53 @@ export async function restoreGcsCache(
         let fileToDownload: ReturnType<typeof bucket.file> | undefined =
             undefined;
 
-        // 1. Check exact primary key
-        const exactFile = bucket.file(`${gcpPrefix}${primaryKey}.tar.gz`);
-        const [exactExists] = await exactFile.exists();
-        if (exactExists) {
-            restoredKey = primaryKey;
-            fileToDownload = exactFile;
-        } else {
-            // 2. Check restore keys
-            for (const rKey of restoreKeys) {
-                if (!rKey) continue;
-                const rFile = bucket.file(`${gcpPrefix}${rKey}.tar.gz`);
-                const [rExists] = await rFile.exists();
-                if (rExists) {
-                    restoredKey = rKey;
-                    fileToDownload = rFile;
-                    break;
-                }
+        const keyCandidates = [primaryKey, ...restoreKeys];
 
-                // Prefix search in bucket
-                const searchPrefix = `${gcpPrefix}${rKey}`;
-                const [files] = await bucket.getFiles({ prefix: searchPrefix });
-                const matchingFiles = files.filter(f =>
-                    f.name.endsWith(".tar.gz")
-                );
-                if (matchingFiles.length > 0) {
-                    matchingFiles.sort((a, b) => {
-                        const timeA = a.metadata.updated
-                            ? new Date(a.metadata.updated).getTime()
-                            : 0;
-                        const timeB = b.metadata.updated
-                            ? new Date(b.metadata.updated).getTime()
-                            : 0;
-                        return timeB - timeA;
-                    });
-                    fileToDownload = bucket.file(matchingFiles[0].name);
-                    const nameWithoutPrefix = gcpPrefix && matchingFiles[0].name.startsWith(gcpPrefix)
+        for (const candidateKey of keyCandidates) {
+            if (!candidateKey) continue;
+
+            const candidateZst = bucket.file(
+                `${gcpPrefix}${candidateKey}.tar.zst`
+            );
+            const [zstExists] = await candidateZst.exists();
+            if (zstExists) {
+                restoredKey = candidateKey;
+                fileToDownload = candidateZst;
+                break;
+            }
+
+            const candidateGz = bucket.file(
+                `${gcpPrefix}${candidateKey}.tar.gz`
+            );
+            const [gzExists] = await candidateGz.exists();
+            if (gzExists) {
+                restoredKey = candidateKey;
+                fileToDownload = candidateGz;
+                break;
+            }
+
+            const searchPrefix = `${gcpPrefix}${candidateKey}`;
+            const [files] = await bucket.getFiles({ prefix: searchPrefix });
+            const matchingFiles = files.filter(
+                f => f.name.endsWith(".tar.zst") || f.name.endsWith(".tar.gz")
+            );
+            if (matchingFiles.length > 0) {
+                matchingFiles.sort((a, b) => {
+                    const timeA = a.metadata.updated
+                        ? new Date(a.metadata.updated).getTime()
+                        : 0;
+                    const timeB = b.metadata.updated
+                        ? new Date(b.metadata.updated).getTime()
+                        : 0;
+                    return timeB - timeA;
+                });
+                fileToDownload = bucket.file(matchingFiles[0].name);
+                const nameWithoutPrefix =
+                    gcpPrefix && matchingFiles[0].name.startsWith(gcpPrefix)
                         ? matchingFiles[0].name.slice(gcpPrefix.length)
                         : matchingFiles[0].name;
-                    restoredKey = nameWithoutPrefix.replace(
-                        /\.tar\.gz$/,
-                        ""
-                    );
-                    break;
-                }
+                restoredKey = nameWithoutPrefix.replace(/\.tar\.(zst|gz)$/, "");
+                break;
             }
         }
 
@@ -84,9 +89,8 @@ export async function restoreGcsCache(
         }
 
         core.info(
-            `Downloading cache from GCS bucket gs://${gcpBucket}/${fileToDownload.name}`
+            `Downloading cache stream from GCS bucket gs://${gcpBucket}/${fileToDownload.name}`
         );
-        await fileToDownload.download({ destination: tarPath });
 
         const cwd =
             process.platform === "win32"
@@ -95,16 +99,39 @@ export async function restoreGcsCache(
                     : "C:\\"
                 : "/";
 
-        core.info(`Extracting cache archive from GCS to ${cwd}`);
-        await exec.exec("tar", ["-zxf", tarPath], { cwd });
+        const isZst = fileToDownload.name.endsWith(".tar.zst");
+        const hasZstd = await isZstdAvailable();
 
-        try {
-            if (fs.existsSync(tarPath)) {
-                fs.unlinkSync(tarPath);
-            }
-        } catch {
-            // ignore temp file deletion error
+        let tarArgs: string[];
+        if (isZst && hasZstd) {
+            tarArgs = ["-I", "zstd -d -T0", "-xf", "-"];
+        } else if (isZst) {
+            tarArgs = ["--use-compress-program=zstd", "-xf", "-"];
+        } else {
+            tarArgs = ["-zxf", "-"];
         }
+
+        core.info(`Extracting cache archive from GCS to ${cwd}`);
+        const tarProcess = child_process.spawn("tar", tarArgs, {
+            cwd,
+            stdio: ["pipe", "inherit", "inherit"]
+        });
+
+        const readStream = fileToDownload.createReadStream();
+
+        await Promise.all([
+            pipeline(readStream, tarProcess.stdin),
+            new Promise<void>((resolve, reject) => {
+                tarProcess.on("close", code => {
+                    if (code === 0) resolve();
+                    else
+                        reject(
+                            new Error(`tar process exited with code ${code}`)
+                        );
+                });
+                tarProcess.on("error", err => reject(err));
+            })
+        ]);
 
         return restoredKey;
     } catch (error: unknown) {
@@ -122,14 +149,6 @@ export async function saveGcsCache(
     primaryKey: string
 ): Promise<number> {
     try {
-        const tempDir =
-            process.env["RUNNER_TEMP"] ||
-            (process.platform === "win32" ? "C:\\Windows\\Temp" : "/tmp");
-        const tarPath = path.join(
-            tempDir,
-            `cache_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.tar.gz`
-        );
-
         const cwd =
             process.platform === "win32"
                 ? process.env.SystemDrive
@@ -149,29 +168,52 @@ export async function saveGcsCache(
             return -1;
         }
 
-        core.info(`Creating cache archive for GCS key: ${primaryKey}`);
-        await exec.exec(
-            "tar",
-            ["-zcf", tarPath, ...excludePaths, ...includePaths],
-            { cwd }
+        const hasZstd = await isZstdAvailable();
+        const extension = hasZstd ? ".tar.zst" : ".tar.gz";
+
+        let tarArgs: string[];
+        if (hasZstd) {
+            tarArgs = [
+                "-I",
+                "zstd -T0 -1",
+                "-cf",
+                "-",
+                ...excludePaths,
+                ...includePaths
+            ];
+        } else {
+            tarArgs = ["-zcf", "-", ...excludePaths, ...includePaths];
+        }
+
+        const destFileName = `${gcpPrefix}${primaryKey}${extension}`;
+        core.info(
+            `Creating cache archive and uploading stream to GCS bucket gs://${gcpBucket}/${destFileName}`
         );
 
         const storage = new GoogleCloudStorage();
         const bucket = storage.bucket(gcpBucket);
+        const writeStream = bucket.file(destFileName).createWriteStream({
+            resumable: false
+        });
 
-        const destFileName = `${gcpPrefix}${primaryKey}.tar.gz`;
-        core.info(
-            `Uploading cache to GCS bucket gs://${gcpBucket}/${destFileName}`
-        );
-        await bucket.upload(tarPath, { destination: destFileName });
+        const tarProcess = child_process.spawn("tar", tarArgs, {
+            cwd,
+            stdio: ["ignore", "pipe", "inherit"]
+        });
 
-        try {
-            if (fs.existsSync(tarPath)) {
-                fs.unlinkSync(tarPath);
-            }
-        } catch {
-            // ignore temp file deletion error
-        }
+        await Promise.all([
+            pipeline(tarProcess.stdout, writeStream),
+            new Promise<void>((resolve, reject) => {
+                tarProcess.on("close", code => {
+                    if (code === 0) resolve();
+                    else
+                        reject(
+                            new Error(`tar process exited with code ${code}`)
+                        );
+                });
+                tarProcess.on("error", err => reject(err));
+            })
+        ]);
 
         core.info("Cache saved to Google Cloud Storage successfully");
         return 1;

@@ -1,22 +1,28 @@
 import { afterEach, beforeEach, expect, jest, test } from "@jest/globals";
+import { Readable, Writable } from "stream";
 
 const mockExists = jest.fn<() => Promise<[boolean]>>();
-const mockDownload = jest.fn<() => Promise<void>>();
 const mockGetFiles = jest.fn<() => Promise<[any[]]>>();
-const mockUpload = jest.fn<() => Promise<void>>();
 
 const mockFile = jest.fn((name: string) => ({
     name,
     exists: mockExists,
-    download: mockDownload,
+    createReadStream: jest.fn(() => Readable.from(["mock tar data"])),
+    createWriteStream: jest.fn(
+        () =>
+            new Writable({
+                write(_chunk, _encoding, callback) {
+                    callback();
+                }
+            })
+    ),
     metadata: { updated: "2026-01-01T00:00:00Z" }
 }));
 
 const mockBucket = jest.fn((name: string) => ({
     name,
     file: mockFile,
-    getFiles: mockGetFiles,
-    upload: mockUpload
+    getFiles: mockGetFiles
 }));
 
 jest.unstable_mockModule("@google-cloud/storage", () => ({
@@ -25,8 +31,30 @@ jest.unstable_mockModule("@google-cloud/storage", () => ({
     }))
 }));
 
-jest.unstable_mockModule("@actions/exec", () => ({
-    exec: jest.fn<() => Promise<number>>().mockResolvedValue(0)
+const createMockProcess = () => ({
+    stdin: new Writable({
+        write(_chunk, _encoding, callback) {
+            callback();
+        }
+    }),
+    stdout: Readable.from(["mock stdout tar data"]),
+    on: jest.fn((event: string, cb: (code?: number) => void) => {
+        if (event === "close") {
+            process.nextTick(() => cb(0));
+        }
+    })
+});
+
+const spawnMock = jest.fn(() => createMockProcess());
+
+jest.unstable_mockModule("child_process", () => ({
+    spawn: spawnMock
+}));
+
+const whichMock = jest.fn<() => Promise<string>>().mockResolvedValue("");
+
+jest.unstable_mockModule("@actions/io", () => ({
+    which: whichMock
 }));
 
 jest.unstable_mockModule("@actions/core", () => ({
@@ -38,7 +66,8 @@ jest.unstable_mockModule("@actions/core", () => ({
     debug: jest.fn()
 }));
 
-const exec = await import("@actions/exec");
+const child_process = await import("child_process");
+const io = await import("@actions/io");
 const core = await import("@actions/core");
 const { restoreGcsCache, saveGcsCache } = await import(
     "../src/utils/gcsUtils"
@@ -46,10 +75,14 @@ const { restoreGcsCache, saveGcsCache } = await import(
 
 beforeEach(() => {
     jest.clearAllMocks();
+    whichMock.mockResolvedValue("");
+    spawnMock.mockImplementation(() => createMockProcess() as any);
 });
 
 test("restoreGcsCache returns primary key when exact match exists", async () => {
-    mockExists.mockResolvedValue([true]);
+    mockExists.mockImplementation(async function (this: any) {
+        return [this.name.endsWith(".tar.gz")];
+    });
 
     const result = await restoreGcsCache(
         "my-bucket",
@@ -61,12 +94,32 @@ test("restoreGcsCache returns primary key when exact match exists", async () => 
 
     expect(result).toBe("my-key");
     expect(mockBucket).toHaveBeenCalledWith("my-bucket");
-    expect(mockFile).toHaveBeenCalledWith("my-prefix/my-key.tar.gz");
-    expect(mockDownload).toHaveBeenCalled();
-    expect(exec.exec).toHaveBeenCalledWith(
+    expect(spawnMock).toHaveBeenCalledWith(
         "tar",
-        ["-zxf", expect.any(String)],
-        { cwd: expect.any(String) }
+        ["-zxf", "-"],
+        { cwd: expect.any(String), stdio: ["pipe", "inherit", "inherit"] }
+    );
+});
+
+test("restoreGcsCache uses zstd when zstd archive exists and zstd is available", async () => {
+    whichMock.mockResolvedValue("/usr/bin/zstd");
+    mockExists.mockImplementation(async function (this: any) {
+        return [true];
+    });
+
+    const result = await restoreGcsCache(
+        "my-bucket",
+        "my-prefix/",
+        ["path/to/dir"],
+        "my-key",
+        ["restore-prefix-"]
+    );
+
+    expect(result).toBe("my-key");
+    expect(spawnMock).toHaveBeenCalledWith(
+        "tar",
+        ["-I", "zstd -d -T0", "-xf", "-"],
+        { cwd: expect.any(String), stdio: ["pipe", "inherit", "inherit"] }
     );
 });
 
@@ -90,10 +143,10 @@ test("restoreGcsCache falls back to restore keys when primary key does not exist
     );
 
     expect(result).toBe("restore-prefix-123");
-    expect(exec.exec).toHaveBeenCalledWith(
+    expect(spawnMock).toHaveBeenCalledWith(
         "tar",
-        ["-zxf", expect.any(String)],
-        { cwd: expect.any(String) }
+        ["-zxf", "-"],
+        { cwd: expect.any(String), stdio: ["pipe", "inherit", "inherit"] }
     );
 });
 
@@ -112,9 +165,7 @@ test("restoreGcsCache returns undefined when no match found", async () => {
     expect(result).toBeUndefined();
 });
 
-test("saveGcsCache archives paths and uploads to GCS bucket with prefix", async () => {
-    mockUpload.mockResolvedValue();
-
+test("saveGcsCache archives paths and streams to GCS bucket with prefix", async () => {
     const result = await saveGcsCache(
         "my-bucket",
         "my-prefix/",
@@ -123,18 +174,38 @@ test("saveGcsCache archives paths and uploads to GCS bucket with prefix", async 
     );
 
     expect(result).toBe(1);
-    expect(exec.exec).toHaveBeenCalledWith(
+    expect(spawnMock).toHaveBeenCalledWith(
         "tar",
         [
             "-zcf",
-            expect.any(String),
+            "-",
             expect.stringContaining("--exclude="),
             expect.any(String)
         ],
-        { cwd: expect.any(String) }
+        { cwd: expect.any(String), stdio: ["ignore", "pipe", "inherit"] }
     );
-    expect(mockUpload).toHaveBeenCalledWith(
-        expect.any(String),
-        { destination: "my-prefix/my-key.tar.gz" }
+});
+
+test("saveGcsCache uses zstd when available", async () => {
+    whichMock.mockResolvedValue("/usr/bin/zstd");
+
+    const result = await saveGcsCache(
+        "my-bucket",
+        "my-prefix/",
+        ["path/to/dir"],
+        "my-key"
+    );
+
+    expect(result).toBe(1);
+    expect(spawnMock).toHaveBeenCalledWith(
+        "tar",
+        [
+            "-I",
+            "zstd -T0 -1",
+            "-cf",
+            "-",
+            expect.any(String)
+        ],
+        { cwd: expect.any(String), stdio: ["ignore", "pipe", "inherit"] }
     );
 });
