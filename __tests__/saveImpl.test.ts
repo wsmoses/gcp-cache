@@ -39,8 +39,15 @@ jest.unstable_mockModule("@actions/cache", () => ({
     }
 }));
 
+// Mock gcsUtils
+jest.unstable_mockModule("../src/utils/gcsUtils", () => ({
+    restoreGcsCache: jest.fn(),
+    saveGcsCache: jest.fn()
+}));
+
 const core = await import("@actions/core");
 const cache = await import("@actions/cache");
+const gcsUtils = await import("../src/utils/gcsUtils");
 const { Events, Inputs, RefKey } = await import("../src/constants");
 const { saveImpl } = await import("../src/saveImpl");
 const { StateProvider } = await import("../src/stateProvider");
@@ -280,5 +287,35 @@ test("save with valid inputs uploads a cache", async () => {
         false
     );
 
+    expect(core.setFailed).toHaveBeenCalledTimes(0);
+});
+
+test("save with gcp-bucket calls saveGcsCache", async () => {
+    const primaryKey = "Linux-node-bb828da54c148048dd17899ba9fda624811cfb43";
+    const bucket = "test-gcp-bucket";
+    const prefix = "my-prefix/";
+    const inputPath = "node_modules";
+
+    (core.getState as jest.Mock)
+        .mockReturnValueOnce(primaryKey)
+        .mockReturnValueOnce("")
+        .mockReturnValueOnce(bucket)
+        .mockReturnValueOnce(prefix);
+
+    testUtils.setInput(Inputs.Path, inputPath);
+    testUtils.setInput(Inputs.GcpBucket, bucket);
+    testUtils.setInput(Inputs.GcpPrefix, prefix);
+
+    jest.mocked(gcsUtils.saveGcsCache).mockResolvedValue(1);
+
+    await saveImpl(new StateProvider());
+
+    expect(gcsUtils.saveGcsCache).toHaveBeenCalledWith(
+        bucket,
+        prefix,
+        [inputPath],
+        primaryKey
+    );
+    expect(core.info).toHaveBeenCalledWith(`Cache saved with key: ${primaryKey}`);
     expect(core.setFailed).toHaveBeenCalledTimes(0);
 });

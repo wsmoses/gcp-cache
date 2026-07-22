@@ -34,6 +34,14 @@ inputs:
       save-always does not work as intended and will be removed in a future release.
       A separate `actions/cache/restore` step should be used instead.
       See https://github.com/actions/cache/tree/main/save#always-save-cache for more details.
+  gcp-bucket:
+    description: 'Google Cloud Storage bucket to use for caching (e.g., "my-cache-bucket"). If provided, this is used instead of the default Actions cache.'
+    required: false
+    default: ''
+  gcp-prefix:
+    description: 'An optional prefix for keys stored in the Google Cloud Storage bucket (e.g., "my-prefix/" or "ci-cache/").'
+    required: false
+    default: ''
 outputs:
   cache-hit:
     description: 'A boolean value to indicate an exact match was found for the primary key'

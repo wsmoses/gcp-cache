@@ -8,6 +8,7 @@ import {
     StateProvider
 } from "./stateProvider";
 import * as utils from "./utils/actionUtils";
+import * as gcsUtils from "./utils/gcsUtils";
 
 // Catch and log any unhandled exceptions.  These exceptions can leak out of the uploadChunk method in
 // @actions/toolkit when a failed upload closes the file descriptor causing any in-process reads to
@@ -62,12 +63,28 @@ export async function saveImpl(
             Inputs.EnableCrossOsArchive
         );
 
-        cacheId = await cache.saveCache(
-            cachePaths,
-            primaryKey,
-            { uploadChunkSize: utils.getInputAsInt(Inputs.UploadChunkSize) },
-            enableCrossOsArchive
-        );
+        const gcpBucket =
+            stateProvider.getState(State.GcpBucket) ||
+            core.getInput(Inputs.GcpBucket);
+        const gcpPrefix =
+            stateProvider.getState(State.GcpPrefix) ||
+            core.getInput(Inputs.GcpPrefix);
+
+        if (gcpBucket) {
+            cacheId = await gcsUtils.saveGcsCache(
+                gcpBucket,
+                gcpPrefix,
+                cachePaths,
+                primaryKey
+            );
+        } else {
+            cacheId = await cache.saveCache(
+                cachePaths,
+                primaryKey,
+                { uploadChunkSize: utils.getInputAsInt(Inputs.UploadChunkSize) },
+                enableCrossOsArchive
+            );
+        }
 
         if (cacheId != -1) {
             core.info(`Cache saved with key: ${primaryKey}`);

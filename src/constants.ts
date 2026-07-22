@@ -5,7 +5,9 @@ export enum Inputs {
     UploadChunkSize = "upload-chunk-size", // Input for cache, save action
     EnableCrossOsArchive = "enableCrossOsArchive", // Input for cache, restore, save action
     FailOnCacheMiss = "fail-on-cache-miss", // Input for cache, restore action
-    LookupOnly = "lookup-only" // Input for cache, restore action
+    LookupOnly = "lookup-only", // Input for cache, restore action
+    GcpBucket = "gcp-bucket", // Input for cache, restore, save action
+    GcpPrefix = "gcp-prefix" // Input for cache, restore, save action
 }
 
 export enum Outputs {
@@ -16,7 +18,9 @@ export enum Outputs {
 
 export enum State {
     CachePrimaryKey = "CACHE_KEY",
-    CacheMatchedKey = "CACHE_RESULT"
+    CacheMatchedKey = "CACHE_RESULT",
+    GcpBucket = "GCP_BUCKET",
+    GcpPrefix = "GCP_PREFIX"
 }
 
 export enum Events {

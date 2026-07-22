@@ -8,6 +8,7 @@ import {
     StateProvider
 } from "./stateProvider";
 import * as utils from "./utils/actionUtils";
+import * as gcsUtils from "./utils/gcsUtils";
 
 export async function restoreImpl(
     stateProvider: IStateProvider,
@@ -41,14 +42,35 @@ export async function restoreImpl(
         );
         const failOnCacheMiss = utils.getInputAsBool(Inputs.FailOnCacheMiss);
         const lookupOnly = utils.getInputAsBool(Inputs.LookupOnly);
+        const gcpBucket = core.getInput(Inputs.GcpBucket);
+        const gcpPrefix = core.getInput(Inputs.GcpPrefix);
 
-        const cacheKey = await cache.restoreCache(
-            cachePaths,
-            primaryKey,
-            restoreKeys,
-            { lookupOnly: lookupOnly },
-            enableCrossOsArchive
-        );
+        if (gcpBucket) {
+            stateProvider.setState(State.GcpBucket, gcpBucket);
+            if (gcpPrefix) {
+                stateProvider.setState(State.GcpPrefix, gcpPrefix);
+            }
+        }
+
+        let cacheKey: string | undefined;
+        if (gcpBucket) {
+            cacheKey = await gcsUtils.restoreGcsCache(
+                gcpBucket,
+                gcpPrefix,
+                cachePaths,
+                primaryKey,
+                restoreKeys,
+                { lookupOnly }
+            );
+        } else {
+            cacheKey = await cache.restoreCache(
+                cachePaths,
+                primaryKey,
+                restoreKeys,
+                { lookupOnly: lookupOnly },
+                enableCrossOsArchive
+            );
+        }
 
         if (!cacheKey) {
             // `cache-hit` is intentionally not set to `false` here to preserve existing behavior

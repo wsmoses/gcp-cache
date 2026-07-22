@@ -1,7 +1,7 @@
 import * as cache from "@actions/cache";
 import * as core from "@actions/core";
 
-import { RefKey } from "../constants";
+import { Inputs, RefKey } from "../constants";
 
 export function isGhes(): boolean {
     const ghUrl = new URL(
@@ -67,6 +67,10 @@ export function getInputAsBool(
 }
 
 export function isCacheFeatureAvailable(): boolean {
+    if (core.getInput(Inputs.GcpBucket)) {
+        return true;
+    }
+
     if (cache.isFeatureAvailable()) {
         return true;
     }

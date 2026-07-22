@@ -39,8 +39,15 @@ jest.unstable_mockModule("@actions/cache", () => ({
     }
 }));
 
+// Mock gcsUtils
+jest.unstable_mockModule("../src/utils/gcsUtils", () => ({
+    restoreGcsCache: jest.fn(),
+    saveGcsCache: jest.fn()
+}));
+
 const core = await import("@actions/core");
 const cache = await import("@actions/cache");
+const gcsUtils = await import("../src/utils/gcsUtils");
 const { Events, Inputs, RefKey } = await import("../src/constants");
 const { restoreImpl } = await import("../src/restoreImpl");
 const { StateProvider } = await import("../src/stateProvider");
@@ -356,4 +363,34 @@ test("restore failure with earlyExit should call process exit", async () => {
     );
     expect(processExitMock).toHaveBeenCalledWith(1);
     processExitMock.mockRestore();
+});
+
+test("restore with gcp-bucket calls restoreGcsCache", async () => {
+    const path = "node_modules";
+    const key = "node-test-key";
+    const bucket = "test-gcp-bucket";
+    const prefix = "my-prefix/";
+
+    testUtils.setInput(Inputs.Path, path);
+    testUtils.setInput(Inputs.Key, key);
+    testUtils.setInput(Inputs.GcpBucket, bucket);
+    testUtils.setInput(Inputs.GcpPrefix, prefix);
+
+    jest.mocked(gcsUtils.restoreGcsCache).mockResolvedValue(key);
+
+    await restoreImpl(new StateProvider());
+
+    expect(gcsUtils.restoreGcsCache).toHaveBeenCalledWith(
+        bucket,
+        prefix,
+        [path],
+        key,
+        [],
+        { lookupOnly: false }
+    );
+    expect(core.saveState).toHaveBeenCalledWith("GCP_BUCKET", bucket);
+    expect(core.saveState).toHaveBeenCalledWith("GCP_PREFIX", prefix);
+    expect(core.saveState).toHaveBeenCalledWith("CACHE_KEY", key);
+    expect(core.saveState).toHaveBeenCalledWith("CACHE_RESULT", key);
+    expect(core.setOutput).toHaveBeenCalledWith("cache-hit", "true");
 });
